@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Environment — contains API keys, never commit
+backend/.env
+
+# Database & generated files
+backend/data/
+backend/reports/
+backend/temp/
+
+# Build output
+frontend/dist/
+
+# Generated test artifacts
+backend/playwright-report/
+backend/test-results/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store

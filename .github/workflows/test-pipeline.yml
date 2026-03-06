@@ -1,0 +1,175 @@
+name: AI Test Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Test Manager Project ID'
+        required: true
+      test_case_ids:
+        description: 'Comma-separated test case IDs (leave empty to run all)'
+        required: false
+      run_name:
+        description: 'Custom run name'
+        required: false
+        default: 'GitHub Actions Run'
+
+jobs:
+  test:
+    name: Run Tests
+    # Use self-hosted runner when available, fallback to ubuntu-latest
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && 'self-hosted' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: ${{ github.workspace }}
+
+      - name: Trigger test run via AI Test Manager
+        id: trigger-run
+        env:
+          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL || 'http://localhost:3001' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Build testCaseIds array from input or use all
+          TEST_CASE_IDS="${{ github.event.inputs.test_case_ids }}"
+          PROJECT_ID="${{ github.event.inputs.project_id }}"
+          RUN_NAME="${{ github.event.inputs.run_name || format('GitHub Actions - {0}', github.sha) }}"
+
+          if [ -z "$TEST_CASE_IDS" ]; then
+            # Fetch all test case IDs for the project
+            CASES=$(curl -s "${TEST_MANAGER_URL}/api/testcases?projectId=${PROJECT_ID}" \
+              | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); console.log(JSON.parse(d).map(t=>t.id).join(','))")
+            TEST_CASE_IDS="$CASES"
+          fi
+
+          # Convert comma-separated to JSON array
+          IDS_JSON=$(echo "$TEST_CASE_IDS" | node -e "
+            const ids = require('fs').readFileSync('/dev/stdin','utf8').trim().split(',').filter(Boolean);
+            process.stdout.write(JSON.stringify(ids));
+          ")
+
+          # Trigger run
+          RESPONSE=$(curl -s -X POST "${TEST_MANAGER_URL}/api/runs" \
+            -H "Content-Type: application/json" \
+            -d "{\"projectId\":\"${PROJECT_ID}\",\"testCaseIds\":${IDS_JSON},\"name\":\"${RUN_NAME}\",\"triggeredBy\":\"github-actions\"}")
+
+          RUN_ID=$(echo "$RESPONSE" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); console.log(JSON.parse(d).id)")
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Triggered run: $RUN_ID"
+
+      - name: Wait for test run to complete
+        id: wait-run
+        env:
+          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL || 'http://localhost:3001' }}
+        run: |
+          RUN_ID="${{ steps.trigger-run.outputs.run_id }}"
+          MAX_WAIT=900  # 15 minutes
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(curl -s "${TEST_MANAGER_URL}/api/runs/${RUN_ID}" \
+              | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); console.log(JSON.parse(d).status)")
+
+            echo "Run status: $STATUS (${ELAPSED}s elapsed)"
+
+            if [ "$STATUS" = "passed" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ]; then
+              RESULT=$(curl -s "${TEST_MANAGER_URL}/api/runs/${RUN_ID}")
+              echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+              echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+              break
+            fi
+
+            sleep 10
+            ELAPSED=$((ELAPSED + 10))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "status=timeout" >> "$GITHUB_OUTPUT"
+            echo "Timed out waiting for test run"
+            exit 1
+          fi
+
+      - name: Download test report
+        if: always()
+        env:
+          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL || 'http://localhost:3001' }}
+        run: |
+          RUN_ID="${{ steps.trigger-run.outputs.run_id }}"
+          mkdir -p test-report
+          curl -s "${TEST_MANAGER_URL}/api/reports/${RUN_ID}" -o test-report/index.html || echo "No report available"
+
+      - name: Upload test report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{ github.run_number }}
+          path: test-report/
+          retention-days: 30
+
+      - name: Send Slack notification
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_STATUS: ${{ steps.wait-run.outputs.status }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No Slack webhook configured, skipping"
+            exit 0
+          fi
+
+          STATUS="${RUN_STATUS}"
+          if [ "$STATUS" = "passed" ]; then
+            EMOJI=":large_green_circle:"
+            COLOR="good"
+          else
+            EMOJI=":red_circle:"
+            COLOR="danger"
+          fi
+
+          RESULT='${{ steps.wait-run.outputs.result }}'
+          PASSED=$(echo "$RESULT" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); try { console.log(JSON.parse(d).passed) } catch { console.log(0) }")
+          FAILED=$(echo "$RESULT" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); try { console.log(JSON.parse(d).failed) } catch { console.log(0) }")
+          TOTAL=$(echo "$RESULT" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); try { console.log(JSON.parse(d).total) } catch { console.log(0) }")
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"blocks\": [
+                {
+                  \"type\": \"header\",
+                  \"text\": { \"type\": \"plain_text\", \"text\": \"${EMOJI} CI Test Run: ${STATUS}\" }
+                },
+                {
+                  \"type\": \"section\",
+                  \"fields\": [
+                    { \"type\": \"mrkdwn\", \"text\": \"*Repository:*\n${GITHUB_REPOSITORY}\" },
+                    { \"type\": \"mrkdwn\", \"text\": \"*Commit:*\n\`${GITHUB_SHA:0:7}\`\" },
+                    { \"type\": \"mrkdwn\", \"text\": \"*Results:*\n:white_check_mark: ${PASSED} passed  :x: ${FAILED} failed  (${TOTAL} total)\" },
+                    { \"type\": \"mrkdwn\", \"text\": \"*Actions Run:*\n<https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|View Run>\" }
+                  ]
+                }
+              ]
+            }"
+
+      - name: Fail if tests failed
+        if: steps.wait-run.outputs.status == 'failed' || steps.wait-run.outputs.status == 'error'
+        run: exit 1
