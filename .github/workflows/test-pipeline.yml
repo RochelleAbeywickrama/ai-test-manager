@@ -29,7 +29,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Validate configuration
+        id: validate
+        run: |
+          # Resolve project ID: manual input takes priority, then repo variable DEFAULT_PROJECT_ID
+          PROJECT_ID="${{ github.event.inputs.project_id }}"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_ID="${{ vars.DEFAULT_PROJECT_ID }}"
+          fi
+
+          if [ -z "$PROJECT_ID" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No PROJECT_ID configured. Set DEFAULT_PROJECT_ID as a repository variable, or trigger manually with a project_id input."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "project_id=$PROJECT_ID" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Node.js
+        if: steps.validate.outputs.skip != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -37,46 +55,85 @@ jobs:
           cache-dependency-path: '**/package-lock.json'
 
       - name: Install Playwright browsers
+        if: steps.validate.outputs.skip != 'true'
         run: npx playwright install --with-deps chromium
         working-directory: ${{ github.workspace }}
 
       - name: Trigger test run via AI Test Manager
+        if: steps.validate.outputs.skip != 'true'
         id: trigger-run
         env:
-          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL || 'http://localhost:3001' }}
+          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Build testCaseIds array from input or use all
+          PROJECT_ID="${{ steps.validate.outputs.project_id }}"
           TEST_CASE_IDS="${{ github.event.inputs.test_case_ids }}"
-          PROJECT_ID="${{ github.event.inputs.project_id }}"
-          RUN_NAME="${{ github.event.inputs.run_name || format('GitHub Actions - {0}', github.sha) }}"
+          RUN_NAME="${{ github.event.inputs.run_name }}"
+          if [ -z "$RUN_NAME" ]; then
+            RUN_NAME="GitHub Actions - ${GITHUB_SHA::7}"
+          fi
+
+          if [ -z "$TEST_MANAGER_URL" ]; then
+            echo "ERROR: TEST_MANAGER_URL secret is not set."
+            echo "Add the URL of your deployed AI Test Manager backend as a repository secret."
+            exit 1
+          fi
+
+          # Verify backend is reachable
+          HEALTH=$(curl -sf "${TEST_MANAGER_URL}/health" 2>/dev/null || echo "unreachable")
+          if [ "$HEALTH" = "unreachable" ]; then
+            echo "ERROR: Cannot reach Test Manager at ${TEST_MANAGER_URL}"
+            echo "Ensure the backend is deployed and accessible from this runner."
+            exit 1
+          fi
 
           if [ -z "$TEST_CASE_IDS" ]; then
             # Fetch all test case IDs for the project
-            CASES=$(curl -s "${TEST_MANAGER_URL}/api/testcases?projectId=${PROJECT_ID}" \
-              | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); console.log(JSON.parse(d).map(t=>t.id).join(','))")
-            TEST_CASE_IDS="$CASES"
+            RESPONSE=$(curl -sf "${TEST_MANAGER_URL}/api/testcases?projectId=${PROJECT_ID}" 2>/dev/null || echo "[]")
+            TEST_CASE_IDS=$(echo "$RESPONSE" | node -e "
+              const d = require('fs').readFileSync('/dev/stdin','utf8').trim();
+              try {
+                const arr = JSON.parse(d);
+                console.log(arr.map(t => t.id).join(','));
+              } catch { console.log(''); }
+            ")
           fi
 
-          # Convert comma-separated to JSON array
+          if [ -z "$TEST_CASE_IDS" ]; then
+            echo "ERROR: No test cases found for project ${PROJECT_ID}"
+            exit 1
+          fi
+
+          # Convert comma-separated IDs to JSON array
           IDS_JSON=$(echo "$TEST_CASE_IDS" | node -e "
             const ids = require('fs').readFileSync('/dev/stdin','utf8').trim().split(',').filter(Boolean);
             process.stdout.write(JSON.stringify(ids));
           ")
 
-          # Trigger run
-          RESPONSE=$(curl -s -X POST "${TEST_MANAGER_URL}/api/runs" \
+          # Trigger the run
+          RESPONSE=$(curl -sf -X POST "${TEST_MANAGER_URL}/api/runs" \
             -H "Content-Type: application/json" \
-            -d "{\"projectId\":\"${PROJECT_ID}\",\"testCaseIds\":${IDS_JSON},\"name\":\"${RUN_NAME}\",\"triggeredBy\":\"github-actions\"}")
+            -d "{\"projectId\":\"${PROJECT_ID}\",\"testCaseIds\":${IDS_JSON},\"name\":\"${RUN_NAME}\",\"triggeredBy\":\"github-actions\"}" \
+            2>/dev/null || echo "{}")
 
-          RUN_ID=$(echo "$RESPONSE" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8'); console.log(JSON.parse(d).id)")
+          RUN_ID=$(echo "$RESPONSE" | node -e "
+            const d = require('fs').readFileSync('/dev/stdin','utf8').trim();
+            try { console.log(JSON.parse(d).id || ''); } catch { console.log(''); }
+          ")
+
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: Failed to trigger test run. Response: $RESPONSE"
+            exit 1
+          fi
+
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
           echo "Triggered run: $RUN_ID"
 
       - name: Wait for test run to complete
+        if: steps.validate.outputs.skip != 'true'
         id: wait-run
         env:
-          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL || 'http://localhost:3001' }}
+          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL }}
         run: |
           RUN_ID="${{ steps.trigger-run.outputs.run_id }}"
           MAX_WAIT=900  # 15 minutes
@@ -106,16 +163,16 @@ jobs:
           fi
 
       - name: Download test report
-        if: always()
+        if: steps.validate.outputs.skip != 'true' && always()
         env:
-          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL || 'http://localhost:3001' }}
+          TEST_MANAGER_URL: ${{ secrets.TEST_MANAGER_URL }}
         run: |
           RUN_ID="${{ steps.trigger-run.outputs.run_id }}"
           mkdir -p test-report
           curl -s "${TEST_MANAGER_URL}/api/reports/${RUN_ID}" -o test-report/index.html || echo "No report available"
 
       - name: Upload test report artifact
-        if: always()
+        if: steps.validate.outputs.skip != 'true' && always()
         uses: actions/upload-artifact@v4
         with:
           name: test-report-${{ github.run_number }}
@@ -123,7 +180,7 @@ jobs:
           retention-days: 30
 
       - name: Send Slack notification
-        if: always()
+        if: steps.validate.outputs.skip != 'true' && always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           RUN_STATUS: ${{ steps.wait-run.outputs.status }}
@@ -171,5 +228,5 @@ jobs:
             }"
 
       - name: Fail if tests failed
-        if: steps.wait-run.outputs.status == 'failed' || steps.wait-run.outputs.status == 'error'
+        if: steps.validate.outputs.skip != 'true' && (steps.wait-run.outputs.status == 'failed' || steps.wait-run.outputs.status == 'error')
         run: exit 1
