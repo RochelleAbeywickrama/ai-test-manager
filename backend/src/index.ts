@@ -13,7 +13,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }));
+app.use(cors({ origin: (origin, cb) => cb(null, !origin || /^http:\/\/localhost(:\d+)?$/.test(origin)) }));
 app.use(express.json({ limit: '10mb' }));
 
 app.use('/api/projects', projectsRouter);

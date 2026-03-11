@@ -107,14 +107,23 @@ export async function executeTestRun(
 async function runPlaywright(testDir: string, reportDir: string): Promise<RunResult> {
   const startTime = Date.now();
   const reportPath = path.join(reportDir, 'index.html');
+  const jsonReportPath = path.join(reportDir, 'report.json');
+
+  // Write a temp config so Playwright puts reports in the right place
+  const configPath = path.join(reportDir, 'playwright.config.js');
+  fs.writeFileSync(configPath, `module.exports = {
+    testDir: ${JSON.stringify(testDir)},
+    reporter: [
+      ['html', { outputFolder: ${JSON.stringify(reportDir)}, open: 'never' }],
+      ['json', { outputFile: ${JSON.stringify(jsonReportPath)} }],
+    ],
+  };`);
 
   try {
     await execFileAsync('npx', [
       'playwright',
       'test',
-      '--reporter=html',
-      `--output=${reportDir}`,
-      testDir,
+      '--config', configPath,
     ], { timeout: 300000 });
   } catch {
     // playwright exits with non-zero on test failures, continue to parse results
@@ -122,30 +131,21 @@ async function runPlaywright(testDir: string, reportDir: string): Promise<RunRes
 
   const duration = Date.now() - startTime;
 
-  // Try to read playwright JSON report
-  try {
-    const jsonReport = path.join(reportDir, 'report.json');
-    await execFileAsync('npx', [
-      'playwright',
-      'test',
-      '--reporter=json',
-      testDir,
-    ]);
-    if (fs.existsSync(jsonReport)) {
-      const report = JSON.parse(fs.readFileSync(jsonReport, 'utf-8'));
-      const stats = report.stats || {};
-      return {
-        total: stats.expected + stats.unexpected + stats.skipped || 0,
-        passed: stats.expected || 0,
-        failed: stats.unexpected || 0,
-        skipped: stats.skipped || 0,
-        duration,
-        reportPath,
-        status: (stats.unexpected || 0) > 0 ? 'failed' : 'passed',
-      };
-    }
-  } catch {
-    // ignore
+  if (fs.existsSync(jsonReportPath)) {
+    const report = JSON.parse(fs.readFileSync(jsonReportPath, 'utf-8'));
+    const stats = report.stats || {};
+    const failed = stats.unexpected || 0;
+    const passed = stats.expected || 0;
+    const skipped = stats.skipped || 0;
+    return {
+      total: passed + failed + skipped,
+      passed,
+      failed,
+      skipped,
+      duration,
+      reportPath,
+      status: failed > 0 ? 'failed' : 'passed',
+    };
   }
 
   return { total: 0, passed: 0, failed: 0, skipped: 0, duration, reportPath, status: 'passed' };
