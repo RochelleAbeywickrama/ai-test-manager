@@ -32,7 +32,7 @@ An AI-powered test management tool to plan, write, run, and report on tests — 
 ### 1. Clone and install dependencies
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/RochelleAbeywickrama/ai-test-manager.git
 cd ai-test-manager
 
 # Install root dependencies
